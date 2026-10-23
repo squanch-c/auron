@@ -59,6 +59,7 @@ use datafusion_ext_exprs::{
     spark_udf_wrapper::SparkUDFWrapperExpr, string_contains::StringContainsExpr,
     string_ends_with::StringEndsWithExpr, string_starts_with::StringStartsWithExpr,
 };
+use datafusion_ext_functions::spark_get_json_object::create_spark_parse_json_udf;
 use datafusion_ext_plans::{
     agg::{
         AggExecMode, AggExpr, AggFunction, AggMode, GroupingExpr,
@@ -1021,19 +1022,23 @@ impl PhysicalPlanner {
 
                 let scalar_udf = if scalar_function == protobuf::ScalarFunction::AuronExtFunctions {
                     let fun_name = &e.name;
-                    let fun = datafusion_ext_functions::create_auron_ext_function(
-                        fun_name,
-                        self.partition_id,
-                    )?;
-                    Arc::new(create_udf(
-                        &format!("spark_ext_function_{fun_name}"),
-                        args.iter()
-                            .map(|e| e.data_type(input_schema))
-                            .collect::<Result<Vec<_>, _>>()?,
-                        convert_required!(e.return_type)?,
-                        Volatility::Volatile,
-                        fun,
-                    ))
+                    if fun_name == "Spark_ParseJson" {
+                        Arc::new(create_spark_parse_json_udf())
+                    } else {
+                        let fun = datafusion_ext_functions::create_auron_ext_function(
+                            fun_name,
+                            self.partition_id,
+                        )?;
+                        Arc::new(create_udf(
+                            &format!("spark_ext_function_{fun_name}"),
+                            args.iter()
+                                .map(|e| e.data_type(input_schema))
+                                .collect::<Result<Vec<_>, _>>()?,
+                            convert_required!(e.return_type)?,
+                            Volatility::Volatile,
+                            fun,
+                        ))
+                    }
                 } else {
                     let scalar_udf: Arc<ScalarUDF> = scalar_function.into();
                     scalar_udf
