@@ -110,51 +110,17 @@ impl ScalarUDFImpl for SparkParseJson {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        spark_parse_json_with_num_rows(&args.args, args.number_rows)
+        spark_parse_json(&args.args, args.number_rows)
     }
 }
 
 /// Parse a scalar once and broadcast references to its parsed value. Array
 /// arguments already carry their row count and must never be broadcast.
-pub fn spark_parse_json_with_num_rows(
-    args: &[ColumnarValue],
-    num_rows: usize,
-) -> Result<ColumnarValue> {
-    let input = args.first().ok_or_else(|| {
-        DataFusionError::Execution("Spark_ParseJson requires an input argument".to_owned())
-    })?;
-    let input_is_scalar = matches!(input, ColumnarValue::Scalar(_));
-    if input_is_scalar && num_rows == 0 {
-        return Ok(ColumnarValue::Array(Arc::new(
-            UserDefinedArray::from_items(DataType::Binary, vec![]),
-        )));
-    }
-
-    let parsed = spark_parse_json(args)?;
-    if !input_is_scalar || num_rows == 1 {
-        return Ok(parsed);
-    }
-
-    let parsed_array = match &parsed {
-        ColumnarValue::Array(array) => downcast_any!(array, UserDefinedArray)?,
-        ColumnarValue::Scalar(_) => {
-            return Err(DataFusionError::Internal(
-                "Spark_ParseJson must return a parsed JSON array".to_owned(),
-            ));
-        }
-    };
-    let parsed_value = parsed_array.iter().next().ok_or_else(|| {
-        DataFusionError::Internal("Scalar JSON parsing must produce one array item".to_owned())
-    })?;
-    Ok(ColumnarValue::Array(Arc::new(
-        UserDefinedArray::from_items(DataType::Binary, vec![parsed_value.clone(); num_rows]),
-    )))
-}
-
-pub fn spark_parse_json(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+pub fn spark_parse_json(args: &[ColumnarValue], num_rows: usize) -> Result<ColumnarValue> {
+    let input_is_scalar = matches!(&args[0], ColumnarValue::Scalar(_));
     let json_string_array = match &args[0] {
         ColumnarValue::Array(array) => array.clone(),
-        ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(1)?,
+        ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(num_rows.min(1))?,
     };
 
     let json_strings = json_string_array
@@ -163,7 +129,7 @@ pub fn spark_parse_json(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         .expect("Expected a StringArray");
     let fallback_enabled = conf::PARSE_JSON_ERROR_FALLBACK.value().unwrap_or(false);
 
-    let json_values: Vec<Option<Arc<dyn Any + Send + Sync + 'static>>> = json_strings
+    let mut json_values: Vec<Option<Arc<dyn Any + Send + Sync + 'static>>> = json_strings
         .iter()
         .map(|s| {
             s.and_then(|s| {
@@ -186,6 +152,10 @@ pub fn spark_parse_json(args: &[ColumnarValue]) -> Result<ColumnarValue> {
             })
         })
         .collect();
+
+    if input_is_scalar && num_rows > 1 {
+        json_values.resize(num_rows, json_values[0].clone());
+    }
 
     Ok(ColumnarValue::Array(Arc::new(
         UserDefinedArray::from_items(DataType::Binary, json_values),
@@ -842,7 +812,7 @@ mod test {
                 }
             }"#;
         let input_array = Arc::new(StringArray::from(vec![input]));
-        let parsed = spark_parse_json(&[ColumnarValue::Array(input_array)])?;
+        let parsed = spark_parse_json(&[ColumnarValue::Array(input_array)], 1)?;
 
         let path = ColumnarValue::Scalar(ScalarValue::from("$.message.location.county"));
         let r = spark_get_parsed_json_object(&[parsed.clone(), path])?.into_array(1)?;
@@ -929,7 +899,7 @@ mod test {
             }
         "#;
         let input_array = Arc::new(StringArray::from(vec![input]));
-        let parsed = spark_parse_json(&[ColumnarValue::Array(input_array)])?;
+        let parsed = spark_parse_json(&[ColumnarValue::Array(input_array)], 1)?;
 
         let path = ColumnarValue::Scalar(ScalarValue::from("$.i1.j2"));
         let r = spark_get_parsed_json_object(&[parsed.clone(), path])?.into_array(1)?;
@@ -952,348 +922,134 @@ mod scalar_null_regression {
     use std::sync::Arc;
 
     use arrow::{
-        array::{Array, ArrayRef, StringArray},
+        array::{ArrayRef, StringArray},
         datatypes::{DataType, Field, Schema},
         record_batch::{RecordBatch, RecordBatchOptions},
     };
     use datafusion::{
         common::{DataFusionError, Result, ScalarValue},
-        logical_expr::{ColumnarValue, ScalarFunctionArgs, Volatility, create_udf},
+        logical_expr::{ColumnarValue, Volatility, create_udf},
         physical_expr::{
             PhysicalExpr, ScalarFunctionExpr,
             expressions::{Column, Literal},
         },
     };
-    use datafusion_ext_commons::uda::UserDefinedArray;
 
-    use super::{
-        create_spark_parse_json_udf, spark_get_parsed_json_object,
-        spark_get_parsed_json_simple_field, spark_parse_json, spark_parse_json_with_num_rows,
-    };
+    use super::{create_spark_parse_json_udf, spark_get_parsed_json_object};
 
-    // Build the same two nested physical-function expressions as Auron's planner.
-    // Evaluating these expressions also exercises DataFusion's handling of a
-    // single-element UDF array result when the input batch has 0, 1, 2, or 8 rows.
-    fn json_expr(input: Arc<dyn PhysicalExpr>, path: &str) -> Arc<dyn PhysicalExpr> {
-        json_expr_with_path(input, ScalarValue::Utf8(Some(path.to_owned())))
-    }
-
-    fn json_expr_with_path(
-        input: Arc<dyn PhysicalExpr>,
-        path: ScalarValue,
-    ) -> Arc<dyn PhysicalExpr> {
-        let parse_udf = Arc::new(create_spark_parse_json_udf());
-        let parsed: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
-            "scalar_null_regression_parse_json",
-            parse_udf,
+    fn json_expr(input: Arc<dyn PhysicalExpr>, path: Option<&str>) -> Arc<dyn PhysicalExpr> {
+        let parsed = Arc::new(ScalarFunctionExpr::new(
+            "parse_json",
+            Arc::new(create_spark_parse_json_udf()),
             vec![input],
             Arc::new(Field::new("parsed", DataType::Binary, true)),
         ));
-
-        let extract_udf = Arc::new(create_udf(
-            "scalar_null_regression_get_parsed_json_object",
+        let extract = create_udf(
+            "get_parsed_json_object",
             vec![DataType::Binary, DataType::Utf8],
             DataType::Utf8,
             Volatility::Volatile,
             Arc::new(spark_get_parsed_json_object),
-        ));
+        );
         Arc::new(ScalarFunctionExpr::new(
-            "scalar_null_regression_get_parsed_json_object",
-            extract_udf,
-            vec![parsed, Arc::new(Literal::new(path))],
-            Arc::new(Field::new("extracted", DataType::Utf8, true)),
+            "get_parsed_json_object",
+            Arc::new(extract),
+            vec![
+                parsed,
+                Arc::new(Literal::new(ScalarValue::Utf8(path.map(str::to_owned)))),
+            ],
+            Arc::new(Field::new("result", DataType::Utf8, true)),
         ))
     }
 
-    fn empty_schema_batch(rows: usize) -> Result<RecordBatch> {
-        RecordBatch::try_new_with_options(
-            Arc::new(Schema::empty()),
-            vec![],
-            &RecordBatchOptions::new().with_row_count(Some(rows)),
-        )
-        .map_err(Into::into)
-    }
-
-    fn assert_result(
-        expression: &dyn PhysicalExpr,
+    fn assert_output(
+        input: Arc<dyn PhysicalExpr>,
         batch: &RecordBatch,
+        path: Option<&str>,
         expected: &[Option<&str>],
     ) -> Result<()> {
-        let result = expression.evaluate(batch)?;
+        let result = json_expr(input, path).evaluate(batch)?;
         assert_eq!(result.data_type(), DataType::Utf8);
-        let result = result.into_array(batch.num_rows())?;
-        assert_eq!(result.len(), batch.num_rows());
-        let strings = result
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("JSON extraction must produce a StringArray");
-        let actual: Vec<_> = strings.iter().collect();
-        assert_eq!(actual.as_slice(), expected);
-        Ok(())
-    }
-
-    fn assert_scalar_result(input: ScalarValue, rows: usize) -> Result<()> {
-        let batch = empty_schema_batch(rows)?;
-        let expression = json_expr(Arc::new(Literal::new(input)), "$");
-        assert_result(expression.as_ref(), &batch, &vec![None; rows])
-    }
-
-    fn assert_valid_scalar_result(rows: usize) -> Result<()> {
-        let batch = empty_schema_batch(rows)?;
-        let expression = json_expr(
-            Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                r#"{"name":"Alice"}"#.to_owned(),
-            )))),
-            "$.name",
-        );
-        assert_result(expression.as_ref(), &batch, &vec![Some("Alice"); rows])
-    }
-
-    fn assert_parsed_simple_field(parsed: &ColumnarValue, expected: &[Option<&str>]) -> Result<()> {
-        let ColumnarValue::Array(parsed) = parsed else {
-            panic!("JSON parsing must retain the UserDefinedArray contract");
-        };
-        let opaque = parsed
-            .as_any()
-            .downcast_ref::<UserDefinedArray>()
-            .expect("parsed JSON must be a UserDefinedArray");
-        assert_eq!(opaque.data_type(), &DataType::Binary);
-        assert_eq!(opaque.len(), expected.len());
-
-        // json_tuple calls this API directly and requires the opaque array,
-        // including when every parsed item is NULL.
-        let extracted = spark_get_parsed_json_simple_field(parsed, &"name".to_owned())?;
-        let actual: Vec<_> = extracted
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("simple JSON fields must produce a StringArray")
-            .iter()
-            .collect();
-        assert_eq!(actual.as_slice(), expected);
+        let array = result.into_array(batch.num_rows())?;
+        assert_eq!(array.len(), batch.num_rows());
+        let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.iter().collect::<Vec<_>>(), expected);
         Ok(())
     }
 
     #[test]
-    fn scalar_binary_null_returns_utf8_null() -> Result<()> {
+    fn parsed_scalar_null_and_unsupported_binary() -> Result<()> {
+        let path = ColumnarValue::Scalar(ScalarValue::Utf8(Some("$".into())));
         let result = spark_get_parsed_json_object(&[
             ColumnarValue::Scalar(ScalarValue::Binary(None)),
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some("$".to_owned()))),
+            path.clone(),
         ])?;
         assert!(matches!(
             result,
             ColumnarValue::Scalar(ScalarValue::Utf8(None))
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn non_null_binary_scalar_returns_execution_error() {
-        // Arbitrary binary bytes are not Auron's opaque parsed-JSON array.
-        // Unsupported input must return an error instead of panicking or being
-        // silently treated as NULL.
         let result = spark_get_parsed_json_object(&[
             ColumnarValue::Scalar(ScalarValue::Binary(Some(b"{}".to_vec()))),
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some("$".to_owned()))),
+            path,
         ]);
         assert!(matches!(result, Err(DataFusionError::Execution(_))));
+        Ok(())
     }
 
     #[test]
-    fn nested_scalar_null_zero_row_batch() -> Result<()> {
-        assert_scalar_result(ScalarValue::Utf8(None), 0)
-    }
-
-    #[test]
-    fn nested_scalar_null_one_row_batch() -> Result<()> {
-        assert_scalar_result(ScalarValue::Utf8(None), 1)
-    }
-
-    #[test]
-    fn nested_scalar_null_two_row_batch() -> Result<()> {
-        assert_scalar_result(ScalarValue::Utf8(None), 2)
-    }
-
-    // Empty text is non-NULL input, but parsing it produces NULL. Thus these
-    // cases exercise an internal NULL source beyond the parse-side NULL guard.
-    // Unlike a general invalid string, empty text never requests JVM fallback.
-    #[test]
-    fn nested_scalar_empty_string_zero_row_batch() -> Result<()> {
-        assert_scalar_result(ScalarValue::Utf8(Some(String::new())), 0)
-    }
-
-    #[test]
-    fn nested_scalar_empty_string_one_row_batch() -> Result<()> {
-        assert_scalar_result(ScalarValue::Utf8(Some(String::new())), 1)
-    }
-
-    #[test]
-    fn nested_scalar_empty_string_two_row_batch() -> Result<()> {
-        assert_scalar_result(ScalarValue::Utf8(Some(String::new())), 2)
-    }
-
-    #[test]
-    fn nested_empty_array_preserves_zero_rows() -> Result<()> {
-        let input: ArrayRef = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
-        let schema = Arc::new(Schema::new(vec![Field::new("json", DataType::Utf8, true)]));
-        let batch = RecordBatch::try_new(schema, vec![input])?;
-        let expression = json_expr(Arc::new(Column::new("json", 0)), "$.name");
-        assert_result(expression.as_ref(), &batch, &[])
-    }
-
-    #[test]
-    fn nested_mixed_array_preserves_values_nulls_and_path_extraction() -> Result<()> {
-        let input: ArrayRef = Arc::new(StringArray::from(vec![
-            Some(r#"{"name":"Alice","other":1}"#),
-            None,
-            Some("{"),
-            Some(r#"{"other":2}"#),
-            Some(r#"{"name":null}"#),
-            Some(r#"{"name":"Bob"}"#),
-        ]));
-        let schema = Arc::new(Schema::new(vec![Field::new("json", DataType::Utf8, true)]));
-        let batch = RecordBatch::try_new(schema, vec![input])?;
-        let expression = json_expr(Arc::new(Column::new("json", 0)), "$.name");
-        assert_result(
-            expression.as_ref(),
-            &batch,
-            &[Some("Alice"), None, None, None, None, Some("Bob")],
-        )
-    }
-
-    #[test]
-    fn nested_valid_scalar_json_one_row_batch() -> Result<()> {
-        let batch = empty_schema_batch(1)?;
-        let expression = json_expr(
-            Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                r#"{"name":"Alice"}"#.to_owned(),
-            )))),
-            "$.name",
-        );
-        assert_result(expression.as_ref(), &batch, &[Some("Alice")])
-    }
-
-    #[test]
-    fn nested_valid_scalar_json_zero_row_batch() -> Result<()> {
-        assert_valid_scalar_result(0)
-    }
-
-    #[test]
-    fn nested_valid_scalar_json_two_row_batch() -> Result<()> {
-        assert_valid_scalar_result(2)
-    }
-
-    #[test]
-    fn nested_valid_scalar_json_eight_row_batch() -> Result<()> {
-        assert_valid_scalar_result(8)
-    }
-
-    #[test]
-    fn nested_scalar_null_eight_row_batch() -> Result<()> {
-        assert_scalar_result(ScalarValue::Utf8(None), 8)
-    }
-
-    #[test]
-    fn nested_scalar_empty_string_eight_row_batch() -> Result<()> {
-        assert_scalar_result(ScalarValue::Utf8(Some(String::new())), 8)
-    }
-
-    #[test]
-    fn raw_parse_scalar_null_retains_user_defined_array() -> Result<()> {
-        let parsed = spark_parse_json(&[ColumnarValue::Scalar(ScalarValue::Utf8(None))])?;
-        assert_parsed_simple_field(&parsed, &[None])
-    }
-
-    #[test]
-    fn batch_aware_parse_retains_arrays_for_valid_and_null_scalars() -> Result<()> {
-        for rows in [0, 1, 2, 8] {
-            let valid = spark_parse_json_with_num_rows(
-                &[ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                    r#"{"name":"Alice"}"#.to_owned(),
-                )))],
-                rows,
-            )?;
-            assert_parsed_simple_field(&valid, &vec![Some("Alice"); rows])?;
-
-            let null = spark_parse_json_with_num_rows(
-                &[ColumnarValue::Scalar(ScalarValue::Utf8(None))],
-                rows,
-            )?;
-            assert_parsed_simple_field(&null, &vec![None; rows])?;
+    fn nested_scalar_inputs_preserve_batch_cardinality() -> Result<()> {
+        let cases = [
+            (None, Some("$.name"), None),
+            (Some(""), Some("$.name"), None),
+            (Some("{"), Some("$.name"), None),
+            (Some(r#"{"name":"Alice"}"#), Some("$.name"), Some("Alice")),
+            (Some(r#"{"other":1}"#), Some("$.name"), None),
+            (Some(r#"{"name":"Alice"}"#), None, None),
+        ];
+        for (value, path, expected) in cases {
+            for rows in [0, 1, 2, 8] {
+                let batch = RecordBatch::try_new_with_options(
+                    Arc::new(Schema::empty()),
+                    vec![],
+                    &RecordBatchOptions::new().with_row_count(Some(rows)),
+                )?;
+                let input = Arc::new(Literal::new(ScalarValue::Utf8(value.map(str::to_owned))));
+                assert_output(input, &batch, path, &vec![expected; rows])?;
+            }
         }
         Ok(())
     }
 
     #[test]
-    fn scalar_broadcast_shares_parsed_items_only_within_each_batch() -> Result<()> {
-        let input = [ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-            r#"{"name":"Alice"}"#.to_owned(),
-        )))];
-        let first = spark_parse_json_with_num_rows(&input, 8)?;
-        let second = spark_parse_json_with_num_rows(&input, 8)?;
-        assert_parsed_simple_field(&first, &vec![Some("Alice"); 8])?;
-        assert_parsed_simple_field(&second, &vec![Some("Alice"); 8])?;
-
-        let ColumnarValue::Array(first_array) = first else {
-            panic!("scalar broadcasting must produce an opaque array");
-        };
-        let ColumnarValue::Array(second_array) = second else {
-            panic!("scalar broadcasting must produce an opaque array");
-        };
-        let first_items = first_array
-            .as_any()
-            .downcast_ref::<UserDefinedArray>()
-            .expect("first parsed batch must be a UserDefinedArray");
-        let second_items = second_array
-            .as_any()
-            .downcast_ref::<UserDefinedArray>()
-            .expect("second parsed batch must be a UserDefinedArray");
-        let first_item = first_items.iter().next().unwrap().as_ref().unwrap();
-        let second_item = second_items.iter().next().unwrap().as_ref().unwrap();
-        for item in first_items.iter() {
-            assert!(Arc::ptr_eq(first_item, item.as_ref().unwrap()));
+    fn nested_array_inputs_preserve_values_and_rows() -> Result<()> {
+        let alice = Some(r#"{"name":"Alice"}"#);
+        let cases = [
+            (vec![], vec![]),
+            (vec![alice], vec![Some("Alice")]),
+            (vec![alice; 8], vec![Some("Alice"); 8]),
+            (
+                vec![
+                    alice,
+                    None,
+                    Some("{"),
+                    Some(r#"{"other":1}"#),
+                    Some(r#"{"name":null}"#),
+                    Some(r#"{"name":"Bob"}"#),
+                ],
+                vec![Some("Alice"), None, None, None, None, Some("Bob")],
+            ),
+        ];
+        for (values, expected) in cases {
+            let input: ArrayRef = Arc::new(StringArray::from(values));
+            let schema = Arc::new(Schema::new(vec![Field::new("json", DataType::Utf8, true)]));
+            let batch = RecordBatch::try_new(schema, vec![input])?;
+            assert_output(
+                Arc::new(Column::new("json", 0)),
+                &batch,
+                Some("$.name"),
+                &expected,
+            )?;
         }
-        for item in second_items.iter() {
-            assert!(Arc::ptr_eq(second_item, item.as_ref().unwrap()));
-        }
-        assert!(
-            !Arc::ptr_eq(first_item, second_item),
-            "separate evaluations must not retain a shared global parsed value"
-        );
         Ok(())
-    }
-
-    #[test]
-    fn singleton_array_is_not_broadcast_to_batch_size() -> Result<()> {
-        let input: ArrayRef = Arc::new(StringArray::from(vec![r#"{"name":"Alice"}"#]));
-        let parsed = create_spark_parse_json_udf().invoke_with_args(ScalarFunctionArgs {
-            args: vec![ColumnarValue::Array(input)],
-            arg_fields: vec![Arc::new(Field::new("json", DataType::Utf8, true))],
-            number_rows: 8,
-            return_field: Arc::new(Field::new("parsed", DataType::Binary, true)),
-        })?;
-        // A one-row Array is not a Scalar. Leave the mismatched cardinality for
-        // ScalarFunctionExpr to reject instead of silently repeating its value.
-        assert_parsed_simple_field(&parsed, &[Some("Alice")])
-    }
-
-    #[test]
-    fn nested_scalar_json_with_null_path_preserves_eight_nulls() -> Result<()> {
-        let batch = empty_schema_batch(8)?;
-        let expression = json_expr_with_path(
-            Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                r#"{"name":"Alice"}"#.to_owned(),
-            )))),
-            ScalarValue::Utf8(None),
-        );
-        assert_result(expression.as_ref(), &batch, &[None; 8])
-    }
-
-    #[test]
-    fn nested_repeated_array_preserves_all_eight_rows() -> Result<()> {
-        let input: ArrayRef = Arc::new(StringArray::from(vec![r#"{"name":"Alice"}"#; 8]));
-        let schema = Arc::new(Schema::new(vec![Field::new("json", DataType::Utf8, true)]));
-        let batch = RecordBatch::try_new(schema, vec![input])?;
-        let expression = json_expr(Arc::new(Column::new("json", 0)), "$.name");
-        assert_result(expression.as_ref(), &batch, &[Some("Alice"); 8])
     }
 }

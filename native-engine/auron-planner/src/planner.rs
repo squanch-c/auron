@@ -1020,11 +1020,11 @@ impl PhysicalPlanner {
                     .map(|x| self.try_parse_physical_expr(x, input_schema))
                     .collect::<Result<Vec<_>, _>>()?;
 
-                let scalar_udf = if scalar_function == protobuf::ScalarFunction::AuronExtFunctions {
-                    let fun_name = &e.name;
-                    if fun_name == "Spark_ParseJson" {
+                let scalar_udf = match (scalar_function, e.name.as_str()) {
+                    (protobuf::ScalarFunction::AuronExtFunctions, "Spark_ParseJson") => {
                         Arc::new(create_spark_parse_json_udf())
-                    } else {
+                    }
+                    (protobuf::ScalarFunction::AuronExtFunctions, fun_name) => {
                         let fun = datafusion_ext_functions::create_auron_ext_function(
                             fun_name,
                             self.partition_id,
@@ -1039,9 +1039,7 @@ impl PhysicalPlanner {
                             fun,
                         ))
                     }
-                } else {
-                    let scalar_udf: Arc<ScalarUDF> = scalar_function.into();
-                    scalar_udf
+                    (function, _) => function.into(),
                 };
                 Arc::new(ScalarFunctionExpr::new(
                     scalar_udf.name(),
