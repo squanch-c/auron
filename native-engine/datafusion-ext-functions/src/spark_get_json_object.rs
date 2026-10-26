@@ -25,7 +25,8 @@ use arrow::{
 };
 use auron_jni_bridge::{conf, conf::BooleanConf, jni_call, jni_new_object, jni_new_string};
 use datafusion::{
-    common::{Result, ScalarValue},
+    common::{DataFusionError, Result, ScalarValue},
+    logical_expr::{ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
     physical_plan::ColumnarValue,
 };
 use datafusion_ext_commons::{downcast_any, uda::UserDefinedArray};
@@ -78,10 +79,48 @@ pub fn spark_get_json_object(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     Ok(ColumnarValue::Array(Arc::new(output)))
 }
 
-pub fn spark_parse_json(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+/// Keep the opaque parsed-JSON array at the current batch length so DataFusion
+/// does not try to convert it into a Binary scalar.
+pub fn create_spark_parse_json_udf() -> ScalarUDF {
+    ScalarUDF::from(SparkParseJson {
+        signature: Signature::exact(vec![DataType::Utf8], Volatility::Volatile),
+    })
+}
+
+#[derive(Debug)]
+struct SparkParseJson {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SparkParseJson {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "spark_ext_function_Spark_ParseJson"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Binary)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        spark_parse_json(&args.args, args.number_rows)
+    }
+}
+
+/// Parse a scalar once and broadcast references to its parsed value. Array
+/// arguments already carry their row count and must never be broadcast.
+pub fn spark_parse_json(args: &[ColumnarValue], num_rows: usize) -> Result<ColumnarValue> {
+    let input_is_scalar = matches!(&args[0], ColumnarValue::Scalar(_));
     let json_string_array = match &args[0] {
         ColumnarValue::Array(array) => array.clone(),
-        ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(1)?,
+        ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(num_rows.min(1))?,
     };
 
     let json_strings = json_string_array
@@ -90,7 +129,7 @@ pub fn spark_parse_json(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         .expect("Expected a StringArray");
     let fallback_enabled = conf::PARSE_JSON_ERROR_FALLBACK.value().unwrap_or(false);
 
-    let json_values: Vec<Option<Arc<dyn Any + Send + Sync + 'static>>> = json_strings
+    let mut json_values: Vec<Option<Arc<dyn Any + Send + Sync + 'static>>> = json_strings
         .iter()
         .map(|s| {
             s.and_then(|s| {
@@ -114,6 +153,10 @@ pub fn spark_parse_json(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         })
         .collect();
 
+    if input_is_scalar && num_rows > 1 {
+        json_values.resize(num_rows, json_values[0].clone());
+    }
+
     Ok(ColumnarValue::Array(Arc::new(
         UserDefinedArray::from_items(DataType::Binary, json_values),
     )))
@@ -125,7 +168,15 @@ pub fn spark_get_parsed_json_object(args: &[ColumnarValue]) -> Result<ColumnarVa
             .as_any()
             .downcast_ref::<UserDefinedArray>()
             .expect("Expected a UserDefinedArray"),
-        ColumnarValue::Scalar(_) => unreachable!(),
+        ColumnarValue::Scalar(scalar) if scalar.is_null() => {
+            return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)));
+        }
+        ColumnarValue::Scalar(scalar) => {
+            return Err(DataFusionError::Execution(format!(
+                "Expected a parsed JSON array or NULL scalar, got scalar type {}",
+                scalar.data_type()
+            )));
+        }
     };
 
     let path_string = match &args[1] {
@@ -761,7 +812,7 @@ mod test {
                 }
             }"#;
         let input_array = Arc::new(StringArray::from(vec![input]));
-        let parsed = spark_parse_json(&[ColumnarValue::Array(input_array)])?;
+        let parsed = spark_parse_json(&[ColumnarValue::Array(input_array)], 1)?;
 
         let path = ColumnarValue::Scalar(ScalarValue::from("$.message.location.county"));
         let r = spark_get_parsed_json_object(&[parsed.clone(), path])?.into_array(1)?;
@@ -848,7 +899,7 @@ mod test {
             }
         "#;
         let input_array = Arc::new(StringArray::from(vec![input]));
-        let parsed = spark_parse_json(&[ColumnarValue::Array(input_array)])?;
+        let parsed = spark_parse_json(&[ColumnarValue::Array(input_array)], 1)?;
 
         let path = ColumnarValue::Scalar(ScalarValue::from("$.i1.j2"));
         let r = spark_get_parsed_json_object(&[parsed.clone(), path])?.into_array(1)?;
@@ -862,6 +913,143 @@ mod test {
         // standard jsonpath should output [[200,300],[400, 500],null,"other"]
         // but we have to keep consistent with hive UDFJson
         assert_eq!(v, Some(r#"[200,300,400,500,"other"]"#));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scalar_null_regression {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{ArrayRef, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::{RecordBatch, RecordBatchOptions},
+    };
+    use datafusion::{
+        common::{DataFusionError, Result, ScalarValue},
+        logical_expr::{ColumnarValue, Volatility, create_udf},
+        physical_expr::{
+            PhysicalExpr, ScalarFunctionExpr,
+            expressions::{Column, Literal},
+        },
+    };
+
+    use super::{create_spark_parse_json_udf, spark_get_parsed_json_object};
+
+    fn json_expr(input: Arc<dyn PhysicalExpr>, path: Option<&str>) -> Arc<dyn PhysicalExpr> {
+        let parsed = Arc::new(ScalarFunctionExpr::new(
+            "parse_json",
+            Arc::new(create_spark_parse_json_udf()),
+            vec![input],
+            Arc::new(Field::new("parsed", DataType::Binary, true)),
+        ));
+        let extract = create_udf(
+            "get_parsed_json_object",
+            vec![DataType::Binary, DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Volatile,
+            Arc::new(spark_get_parsed_json_object),
+        );
+        Arc::new(ScalarFunctionExpr::new(
+            "get_parsed_json_object",
+            Arc::new(extract),
+            vec![
+                parsed,
+                Arc::new(Literal::new(ScalarValue::Utf8(path.map(str::to_owned)))),
+            ],
+            Arc::new(Field::new("result", DataType::Utf8, true)),
+        ))
+    }
+
+    fn assert_output(
+        input: Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+        path: Option<&str>,
+        expected: &[Option<&str>],
+    ) -> Result<()> {
+        let result = json_expr(input, path).evaluate(batch)?;
+        assert_eq!(result.data_type(), DataType::Utf8);
+        let array = result.into_array(batch.num_rows())?;
+        assert_eq!(array.len(), batch.num_rows());
+        let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.iter().collect::<Vec<_>>(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_scalar_null_and_unsupported_binary() -> Result<()> {
+        let path = ColumnarValue::Scalar(ScalarValue::Utf8(Some("$".into())));
+        let result = spark_get_parsed_json_object(&[
+            ColumnarValue::Scalar(ScalarValue::Binary(None)),
+            path.clone(),
+        ])?;
+        assert!(matches!(
+            result,
+            ColumnarValue::Scalar(ScalarValue::Utf8(None))
+        ));
+        let result = spark_get_parsed_json_object(&[
+            ColumnarValue::Scalar(ScalarValue::Binary(Some(b"{}".to_vec()))),
+            path,
+        ]);
+        assert!(matches!(result, Err(DataFusionError::Execution(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_scalar_inputs_preserve_batch_cardinality() -> Result<()> {
+        let cases = [
+            (None, Some("$.name"), None),
+            (Some(""), Some("$.name"), None),
+            (Some("{"), Some("$.name"), None),
+            (Some(r#"{"name":"Alice"}"#), Some("$.name"), Some("Alice")),
+            (Some(r#"{"other":1}"#), Some("$.name"), None),
+            (Some(r#"{"name":"Alice"}"#), None, None),
+        ];
+        for (value, path, expected) in cases {
+            for rows in [0, 1, 2, 8] {
+                let batch = RecordBatch::try_new_with_options(
+                    Arc::new(Schema::empty()),
+                    vec![],
+                    &RecordBatchOptions::new().with_row_count(Some(rows)),
+                )?;
+                let input = Arc::new(Literal::new(ScalarValue::Utf8(value.map(str::to_owned))));
+                assert_output(input, &batch, path, &vec![expected; rows])?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nested_array_inputs_preserve_values_and_rows() -> Result<()> {
+        let alice = Some(r#"{"name":"Alice"}"#);
+        let cases = [
+            (vec![], vec![]),
+            (vec![alice], vec![Some("Alice")]),
+            (vec![alice; 8], vec![Some("Alice"); 8]),
+            (
+                vec![
+                    alice,
+                    None,
+                    Some("{"),
+                    Some(r#"{"other":1}"#),
+                    Some(r#"{"name":null}"#),
+                    Some(r#"{"name":"Bob"}"#),
+                ],
+                vec![Some("Alice"), None, None, None, None, Some("Bob")],
+            ),
+        ];
+        for (values, expected) in cases {
+            let input: ArrayRef = Arc::new(StringArray::from(values));
+            let schema = Arc::new(Schema::new(vec![Field::new("json", DataType::Utf8, true)]));
+            let batch = RecordBatch::try_new(schema, vec![input])?;
+            assert_output(
+                Arc::new(Column::new("json", 0)),
+                &batch,
+                Some("$.name"),
+                &expected,
+            )?;
+        }
         Ok(())
     }
 }

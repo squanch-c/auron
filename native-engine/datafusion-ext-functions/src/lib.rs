@@ -63,7 +63,6 @@ pub fn create_auron_ext_function(
         "Spark_GetParsedJsonObject" => {
             Arc::new(spark_get_json_object::spark_get_parsed_json_object)
         }
-        "Spark_ParseJson" => Arc::new(spark_get_json_object::spark_parse_json),
         "Spark_ArrayReverse" => Arc::new(spark_array::array_reverse),
         "Spark_ArrayFlatten" => Arc::new(spark_array::array_flatten),
         "Spark_MakeArray" => Arc::new(spark_make_array::array),
