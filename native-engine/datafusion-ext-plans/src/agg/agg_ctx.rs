@@ -259,7 +259,27 @@ impl AggContext {
         acc_table: &mut AccTable,
         acc_idx: IdxSelection,
     ) -> Result<()> {
-        self.update_batch_slice_to_acc_table(batch, 0, batch.num_rows(), acc_table, acc_idx)
+        self.update_batch_slice_to_acc_table(
+            batch,
+            0,
+            batch.num_rows(),
+            acc_table,
+            acc_idx,
+            &mut None,
+        )
+    }
+
+    pub fn create_merging_acc_table(&self, batch: &RecordBatch) -> Result<AccTable> {
+        let mut merging_acc_table = self.create_acc_table(0);
+        let mut acc_arrays_start = batch.num_columns() - self.input_acc_arrays_len;
+
+        for (agg_idx, agg) in &self.need_partial_merge_aggs {
+            let num_acc_arrays = agg.acc_array_data_types().len();
+            let acc_arrays = &batch.columns()[acc_arrays_start..][..num_acc_arrays];
+            acc_arrays_start += num_acc_arrays;
+            merging_acc_table.cols_mut()[*agg_idx].unfreeze_from_arrays(acc_arrays)?;
+        }
+        Ok(merging_acc_table)
     }
 
     pub fn update_batch_slice_to_acc_table(
@@ -269,6 +289,7 @@ impl AggContext {
         batch_end_idx: usize,
         acc_table: &mut AccTable,
         acc_idx: IdxSelection,
+        merging_acc_table: &mut Option<AccTable>,
     ) -> Result<()> {
         // NOTE:
         // arrow-ffi with sliced batch is buggy in older arrow-java, so we use unsliced
@@ -372,22 +393,14 @@ impl AggContext {
 
         // partial merge
         if self.need_partial_merge {
-            let mut merging_acc_table = self.create_acc_table(0);
-
-            if self.need_partial_merge {
-                let mut acc_arrays_start = batch.num_columns() - self.input_acc_arrays_len;
-                for (agg_idx, agg) in &self.need_partial_merge_aggs {
-                    let acc_arrays = &batch.columns()[acc_arrays_start..]
-                        .iter()
-                        .take(agg.acc_array_data_types().len())
-                        .map(|array| array.slice(batch_start_idx, batch_end_idx - batch_start_idx))
-                        .collect::<Vec<_>>();
-                    acc_arrays_start += agg.acc_array_data_types().len();
-                    merging_acc_table.cols_mut()[*agg_idx].unfreeze_from_arrays(&acc_arrays)?;
+            let merging_acc_table = match merging_acc_table {
+                Some(merging_acc_table) => merging_acc_table,
+                merging_acc_table => {
+                    merging_acc_table.insert(self.create_merging_acc_table(batch)?)
                 }
-            }
-            let batch_selection = IdxSelection::Range(0, batch_end_idx - batch_start_idx);
-            self.partial_merge(acc_table, acc_idx, &mut merging_acc_table, batch_selection)?;
+            };
+            let batch_selection = IdxSelection::Range(batch_start_idx, batch_end_idx);
+            self.partial_merge(acc_table, acc_idx, merging_acc_table, batch_selection)?;
         }
         Ok(())
     }
@@ -625,5 +638,130 @@ impl AggContext {
     pub fn get_or_try_init_udaf_mem_tracker(&self) -> Result<&SparkUDAFMemTracker> {
         self.udaf_mem_tracker
             .get_or_try_init(|| SparkUDAFMemTracker::try_new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::{
+        array::{AsArray, Float64Array, Int64Array},
+        datatypes::{DataType, Float64Type, Int64Type},
+    };
+    use datafusion::physical_expr::expressions::Column;
+
+    use super::*;
+    use crate::agg::{count::AggCount, sum::AggSum};
+
+    fn partial_output_batch(num_rows: usize) -> RecordBatch {
+        let keys = Int64Array::from((0..num_rows as i64).map(|i| i / 3).collect::<Vec<_>>());
+        let sums = Float64Array::from((0..num_rows).map(|i| i as f64 * 1.5).collect::<Vec<_>>());
+        let counts = Int64Array::from((0..num_rows as i64).map(|i| i % 5).collect::<Vec<_>>());
+        RecordBatch::try_from_iter_with_nullable(vec![
+            ("key", Arc::new(keys) as ArrayRef, false),
+            ("sum", Arc::new(sums) as ArrayRef, true),
+            ("cnt", Arc::new(counts) as ArrayRef, false),
+        ])
+        .expect("failed to create test batch")
+    }
+
+    fn merging_agg_ctx(schema: SchemaRef) -> Result<AggContext> {
+        AggContext::try_new(
+            AggExecMode::SortAgg,
+            schema,
+            vec![GroupingExpr {
+                field_name: "key".to_string(),
+                expr: Arc::new(Column::new("key", 0)),
+            }],
+            vec![
+                AggExpr {
+                    field_name: "sum".to_string(),
+                    mode: AggMode::Final,
+                    agg: Arc::new(AggSum::try_new(
+                        Arc::new(Column::new("sum", 1)),
+                        DataType::Float64,
+                    )?),
+                    filter: None,
+                },
+                AggExpr {
+                    field_name: "cnt".to_string(),
+                    mode: AggMode::Final,
+                    agg: Arc::new(AggCount::try_new(
+                        vec![Arc::new(Column::new("cnt", 2))],
+                        DataType::Int64,
+                    )?),
+                    filter: None,
+                },
+            ],
+            false,
+            false,
+        )
+    }
+
+    fn merge_in_ranges(
+        agg_ctx: &AggContext,
+        batch: &RecordBatch,
+        split_points: &[usize],
+    ) -> Result<Vec<ArrayRef>> {
+        let num_rows = batch.num_rows();
+        let mut acc_table = agg_ctx.create_acc_table(num_rows);
+        let mut merging_acc_table = None;
+        let mut start = 0;
+
+        for &end in split_points.iter().chain(std::iter::once(&num_rows)) {
+            let acc_indices = (start..end).collect::<Vec<_>>();
+            agg_ctx.update_batch_slice_to_acc_table(
+                batch,
+                start,
+                end,
+                &mut acc_table,
+                IdxSelection::Indices(&acc_indices),
+                &mut merging_acc_table,
+            )?;
+            start = end;
+        }
+        agg_ctx.build_agg_columns(&mut acc_table, IdxSelection::Range(0, num_rows))
+    }
+
+    fn assert_columns_eq(expected: &[ArrayRef], actual: &[ArrayRef]) {
+        let expected_sums = expected[0].as_primitive::<Float64Type>();
+        let actual_sums = actual[0].as_primitive::<Float64Type>();
+        let expected_counts = expected[1].as_primitive::<Int64Type>();
+        let actual_counts = actual[1].as_primitive::<Int64Type>();
+        assert_eq!(expected_sums, actual_sums);
+        assert_eq!(expected_counts, actual_counts);
+    }
+
+    #[test]
+    fn test_partial_merge_row_ranges_match_whole_batch() -> Result<()> {
+        let batch = partial_output_batch(97);
+        let agg_ctx = merging_agg_ctx(batch.schema())?;
+
+        let whole = merge_in_ranges(&agg_ctx, &batch, &[])?;
+        let splitted = merge_in_ranges(&agg_ctx, &batch, &[13, 40, 40, 96])?;
+        assert_columns_eq(&whole, &splitted);
+        Ok(())
+    }
+
+    #[test]
+    fn test_partial_merge_accepts_sliced_input_batch() -> Result<()> {
+        let batch = partial_output_batch(97);
+        let sliced = batch.slice(11, 63);
+        let agg_ctx = merging_agg_ctx(sliced.schema())?;
+
+        let expected = merge_in_ranges(
+            &merging_agg_ctx(batch.schema())?,
+            &RecordBatch::try_new(
+                sliced.schema(),
+                sliced
+                    .columns()
+                    .iter()
+                    .map(|c| arrow::compute::concat(&[c.as_ref()]).expect("concat failed"))
+                    .collect(),
+            )?,
+            &[],
+        )?;
+        let actual = merge_in_ranges(&agg_ctx, &sliced, &[7, 30])?;
+        assert_columns_eq(&expected, &actual);
+        Ok(())
     }
 }
