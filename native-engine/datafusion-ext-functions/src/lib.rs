@@ -39,6 +39,7 @@ mod spark_null_if;
 pub mod spark_round;
 mod spark_sqrt;
 mod spark_strings;
+mod spark_try_add;
 mod spark_unscaled_value;
 #[cfg(test)]
 mod udf_tests;
@@ -113,6 +114,7 @@ pub fn create_auron_ext_function(
         }
         "Spark_Sqrt" => shared_function!(spark_sqrt::spark_sqrt),
         "Spark_IsNaN" => shared_function!(spark_isnan::spark_isnan),
+        "Spark_TryAdd" => shared_function!(spark_try_add::spark_try_add),
         "Flink_UnixTimestamp" => shared_function!(flink_datetime::flink_unix_timestamp),
         "Flink_UnixTimestampNow" => shared_function!(flink_datetime::flink_unix_timestamp_now),
         _ => df_unimplemented_err!("auron ext function not implemented: {name}")?,

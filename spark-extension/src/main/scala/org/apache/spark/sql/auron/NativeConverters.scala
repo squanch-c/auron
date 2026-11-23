@@ -68,6 +68,7 @@ import org.apache.spark.sql.types.DecimalType
 import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.sql.types.FloatType
 import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.IntegralType
 import org.apache.spark.sql.types.LongType
 import org.apache.spark.sql.types.MapType
 import org.apache.spark.sql.types.NullType
@@ -592,6 +593,9 @@ object NativeConverters extends Logging {
       case GreaterThanOrEqual(lhs, rhs) => buildBinaryExprNode(lhs, rhs, "GtEq")
       case LessThanOrEqual(lhs, rhs) => buildBinaryExprNode(lhs, rhs, "LtEq")
       case EqualNullSafe(lhs, rhs) => buildBinaryExprNode(lhs, rhs, "IsNotDistinctFrom")
+
+      case e: Add if e.dataType.isInstanceOf[IntegralType] && Shims.get.isTryAdd(e) =>
+        buildExtScalarFunction("Spark_TryAdd", e.children, e.dataType)
 
       case e: Add if !e.dataType.isInstanceOf[DecimalType] || decimalArithOpEnabled =>
         val lhs = e.left

@@ -38,6 +38,7 @@ import org.apache.spark.sql.auron.NativeConverters.NativeExprWrapperBase
 import org.apache.spark.sql.auron.join.JoinBuildSides.{JoinBuildLeft, JoinBuildRight, JoinBuildSide}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
+import org.apache.spark.sql.catalyst.expressions.Add
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.Generator
@@ -808,6 +809,16 @@ class ShimsImpl extends Shims with Logging {
 
   override def getLikeEscapeChar(expr: Expression): Char = {
     expr.asInstanceOf[Like].escapeChar
+  }
+
+  @nowarn("cat=unused") // Some params temporarily unused
+  @sparkver("3.0 / 3.1 / 3.2 / 3.3")
+  override def isTryAdd(expr: Add): Boolean = false
+
+  @sparkver("3.4 / 3.5 / 4.0 / 4.1 / 4.2")
+  override def isTryAdd(expr: Add): Boolean = {
+    import org.apache.spark.sql.catalyst.expressions.EvalMode
+    expr.evalMode == EvalMode.TRY
   }
 
   @sparkver("3.0")

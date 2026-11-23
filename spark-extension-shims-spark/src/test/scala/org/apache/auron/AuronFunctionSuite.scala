@@ -31,6 +31,30 @@ import org.apache.auron.util.{AuronTestUtils, SparkVersionUtil}
 
 class AuronFunctionSuite extends AuronQueryTest with BaseAuronSQLSuite {
 
+  test("native try_add returns null on bigint overflow") {
+    if (AuronTestUtils.isSparkV34OrGreater) {
+      withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        withTable("t_try_add") {
+          sql("create table t_try_add using parquet as select id from range(4)")
+          val query = """select id, try_add(9223372036854775807L, id) as v_try_add
+              |from (select /*+ REPARTITION(2) */ id from t_try_add) inputs""".stripMargin
+          for (ansi <- Seq("false", "true")) {
+            withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+              val df = checkSparkAnswer(query)
+              val plan = df.queryExecution.executedPlan
+              val projects = collect(plan) { case p: NativeProjectBase => p }
+              assert(projects.flatMap(_.expressions).exists {
+                case a: Alias if a.name == "v_try_add" =>
+                  NativeConverters.convertExpr(a.child).getScalarFunction.getName == "Spark_TryAdd"
+                case _ => false
+              })
+            }
+          }
+        }
+      }
+    }
+  }
+
   test("get_json_object with scalar subquery inputs") {
     withSQLConf(
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",

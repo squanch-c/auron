@@ -34,6 +34,7 @@ import org.apache.spark.sql.SQLContext
 import org.apache.spark.sql.auron.join.JoinBuildSides.JoinBuildSide
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
+import org.apache.spark.sql.catalyst.expressions.Add
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.Generator
@@ -254,6 +255,8 @@ abstract class Shims {
   def convertMoreAggregateExpr(e: AggregateExpression): Option[pb.PhysicalExprNode]
 
   def getLikeEscapeChar(expr: Expression): Char
+
+  def isTryAdd(expr: Add): Boolean
 
   def getMakeDateFailOnError(expr: Expression): Boolean
 
