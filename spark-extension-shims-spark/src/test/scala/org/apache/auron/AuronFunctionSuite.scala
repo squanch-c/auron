@@ -20,7 +20,7 @@ import java.text.SimpleDateFormat
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.{AuronQueryTest, Row}
-import org.apache.spark.sql.auron.NativeConverters
+import org.apache.spark.sql.auron.{NativeConverters, Shims}
 import org.apache.spark.sql.catalyst.expressions.{Alias, GetJsonObject}
 import org.apache.spark.sql.execution.ProjectExec
 import org.apache.spark.sql.execution.auron.plan.NativeProjectBase
@@ -31,9 +31,11 @@ import org.apache.auron.util.{AuronTestUtils, SparkVersionUtil}
 
 class AuronFunctionSuite extends AuronQueryTest with BaseAuronSQLSuite {
 
-  test("native try_add returns null on bigint overflow") {
-    if (AuronTestUtils.isSparkV34OrGreater) {
-      withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+  test("try_add returns null on bigint overflow") {
+    if (AuronTestUtils.isSparkV32OrGreater) {
+      withSQLConf(
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        "spark.auron.udf.singleChildFallback.enabled" -> "true") {
         withTable("t_try_add") {
           sql("create table t_try_add using parquet as select id from range(4)")
           val query = """select id, try_add(9223372036854775807L, id) as v_try_add
@@ -42,12 +44,23 @@ class AuronFunctionSuite extends AuronQueryTest with BaseAuronSQLSuite {
             withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
               val df = checkSparkAnswer(query)
               val plan = df.queryExecution.executedPlan
-              val projects = collect(plan) { case p: NativeProjectBase => p }
-              assert(projects.flatMap(_.expressions).exists {
-                case a: Alias if a.name == "v_try_add" =>
-                  NativeConverters.convertExpr(a.child).getScalarFunction.getName == "Spark_TryAdd"
-                case _ => false
-              })
+              if (AuronTestUtils.isSparkV34OrGreater) {
+                val projects = collect(plan) { case p: NativeProjectBase => p }
+                assert(projects.flatMap(_.expressions).exists {
+                  case Alias(child, "v_try_add") =>
+                    NativeConverters.convertExpr(child).getScalarFunction.getName == "Spark_TryAdd"
+                  case _ => false
+                })
+              } else {
+                val projects = collect(plan) { case p: ProjectExec => p }
+                assert(projects.flatMap(_.projectList).exists {
+                  case Alias(child, "v_try_add") => Shims.get.containsLegacyIntegralTryAdd(child)
+                  case _ => false
+                })
+                // TryEval also catches operand errors in the final aggregate projection.
+                checkSparkAnswer(
+                  "select abs(try_add(1L, max(id) * 9223372036854775807L)) from t_try_add")
+              }
             }
           }
         }

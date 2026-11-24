@@ -821,6 +821,16 @@ class ShimsImpl extends Shims with Logging {
     expr.evalMode == EvalMode.TRY
   }
 
+  @sparkver("3.2 / 3.3")
+  override def containsLegacyIntegralTryAdd(expr: Expression): Boolean = {
+    import org.apache.spark.sql.catalyst.expressions.TryEval
+    import org.apache.spark.sql.types.IntegralType
+    expr.find {
+      case TryEval(add: Add) => add.failOnError && add.dataType.isInstanceOf[IntegralType]
+      case _ => false
+    }.isDefined
+  }
+
   @sparkver("3.0")
   override def getMakeDateFailOnError(expr: Expression): Boolean = false
 

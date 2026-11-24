@@ -258,6 +258,9 @@ abstract class Shims {
 
   def isTryAdd(expr: Add): Boolean
 
+  @nowarn("cat=unused")
+  def containsLegacyIntegralTryAdd(expr: Expression): Boolean = false
+
   def getMakeDateFailOnError(expr: Expression): Boolean
 
   def getRoundFailOnError(expr: Expression): Boolean

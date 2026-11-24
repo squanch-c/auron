@@ -331,6 +331,12 @@ object NativeConverters extends Logging {
   }
 
   def convertExpr(sparkExpr: Expression): pb.PhysicalExprNode = {
+    // Spark 3.2/3.3 catch operand errors inside TryEval. Keep the whole expression in Spark
+    // before single-child fallback can extract the Add and evaluate it natively.
+    if (Shims.get.containsLegacyIntegralTryAdd(sparkExpr)) {
+      throw new NotImplementedError("integer try_add requires Spark evaluation on Spark 3.2/3.3")
+    }
+
     def fallbackToError: Expression => pb.PhysicalExprNode = { e =>
       throw new NotImplementedError(s"unsupported expression: (${e.getClass}) $e")
     }
