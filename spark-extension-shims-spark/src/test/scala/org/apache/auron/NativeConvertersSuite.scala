@@ -18,7 +18,9 @@ package org.apache.auron
 
 import org.apache.spark.sql.AuronQueryTest
 import org.apache.spark.sql.auron.NativeConverters
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Cast, Expression, GreaterThan, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Expression, GreaterThan, Literal}
+import org.apache.spark.sql.catalyst.optimizer.SimplifyCasts
+import org.apache.spark.sql.catalyst.plans.logical.Project
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BooleanType, DataType, DoubleType, FloatType, IntegerType, StringType}
 
@@ -57,6 +59,32 @@ class NativeConvertersSuite
        } else Nil)
     functions.map { function =>
       sql(s"select $function").queryExecution.analyzed.expressions.head.children.head
+    }
+  }
+
+  test("timestamp plus one day preserves local time across daylight saving transitions") {
+    if (AuronTestUtils.isSparkV32OrGreater) {
+      val query = """
+        |SELECT (CASE WHEN id = 0 THEN TIMESTAMP '2024-03-09 12:00:00'
+        |             ELSE TIMESTAMP '2024-11-02 12:00:00' END) + INTERVAL '1' DAY AS ts
+        |FROM range(2)
+        |""".stripMargin
+      for (zone <- Seq("UTC", "America/Los_Angeles")) {
+        withSQLConf(
+          SQLConf.SESSION_LOCAL_TIMEZONE.key -> zone,
+          "spark.auron.udf.singleChildFallback.enabled" -> "true") {
+          val df = checkSparkAnswer(query)
+          if (zone == "UTC") {
+            val addition = SimplifyCasts(df.queryExecution.analyzed) match {
+              case Project(Seq(alias: Alias), _) => alias.child
+              case plan => fail(plan.toString)
+            }
+            val native = NativeConverters.convertExpr(addition)
+            assert(native.getBinaryExpr.getOp == "Plus")
+            assert(!native.toString.contains("spark_udf_wrapper_expr"), native)
+          }
+        }
+      }
     }
   }
 
